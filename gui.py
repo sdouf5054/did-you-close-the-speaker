@@ -29,6 +29,7 @@ if IS_WINDOWS:
     WM_ENDSESSION = 0x0016
     PBT_APMRESUMEAUTOMATIC = 0x0012
     PBT_APMRESUMESUSPEND = 0x0007
+    PBT_APMSUSPEND = 0x0004
 
     # For idle detection via GetLastInputInfo
     class LASTINPUTINFO(ctypes.Structure):
@@ -421,8 +422,8 @@ class MainWindow(QMainWindow):
         self.chk_idle.stateChanged.connect(self._on_idle_changed)
         idle_row.addWidget(self.chk_idle)
 
-        IDLE_OPTIONS = ["5분", "10분", "15분", "20분", "25분", "30분", "45분", "60분"]
-        IDLE_VALUES = [5, 10, 15, 20, 25, 30, 45, 60]
+        IDLE_OPTIONS = ["1분","5분", "10분", "15분", "20분", "25분", "30분", "45분", "60분"]
+        IDLE_VALUES = [1, 5, 10, 15, 20, 25, 30, 45, 60]
 
         self.combo_idle = QComboBox()
         self.combo_idle.addItems(IDLE_OPTIONS)
@@ -488,14 +489,14 @@ class MainWindow(QMainWindow):
         self.combo_idle.setEnabled(enabled)
         self.chk_idle_auto_on.setEnabled(enabled)
         if enabled:
-            self._idle_check_timer.start(30_000)
+            self._idle_check_timer.start(1_000)
         else:
             self._idle_check_timer.stop()
         save_settings(self.settings)
         logger.info(f"Idle timer {'enabled' if enabled else 'disabled'}")
 
     def _on_idle_time_changed(self, index):
-        values = [5, 10, 15, 20, 25, 30, 45, 60]
+        values = [1, 5, 10, 15, 20, 25, 30, 45, 60]
         if 0 <= index < len(values):
             self.settings["idle_timer_minutes"] = values[index]
             save_settings(self.settings)
@@ -516,7 +517,7 @@ class MainWindow(QMainWindow):
         self._idle_check_timer = QTimer(self)
         self._idle_check_timer.timeout.connect(self._check_idle)
         if self.settings.get("idle_timer_enabled", False):
-            self._idle_check_timer.start(30_000)
+            self._idle_check_timer.start(1_000)
 
     # ----- Single instance show-window listener -----
 
@@ -564,6 +565,9 @@ class MainWindow(QMainWindow):
 
         idle_sec = self._get_idle_seconds()
         threshold_sec = self.settings.get("idle_timer_minutes", 15) * 60
+
+        if threshold_sec - 5 <= idle_sec < threshold_sec and not self._idle_turned_off:
+            logger.info(f"Idle check: {idle_sec:.0f}s / {threshold_sec}s")
 
         if idle_sec >= threshold_sec:
             # User is idle — turn off speaker if it's on
@@ -696,7 +700,14 @@ class MainWindow(QMainWindow):
                     self.plug_state = PlugState.UNKNOWN
                     self._idle_turned_off = False
                     QTimer.singleShot(3000, self.refresh_status)
-
+                if msg.wParam == PBT_APMSUSPEND:
+                    logger.info("System entering sleep — turning off speaker.")
+                    try:
+                        asyncio.run(self._watchdog_turn_off())
+                        logger.info("Speaker OFF before sleep.")
+                    except Exception as e:
+                        logger.error(f"Sleep watchdog failed: {e}")         
+                               
             # Shutdown/restart watchdog
             elif msg.message == WM_QUERYENDSESSION:
                 if self.settings.get("watchdog_enabled", False):

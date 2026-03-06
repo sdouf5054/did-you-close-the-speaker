@@ -48,6 +48,8 @@ APP_DIR = Path(__file__).parent
 LOG_DIR = APP_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 SETTINGS_PATH = APP_DIR / "settings.json"
+ICON_PATH = APP_DIR / "assets" / "ico.ico"
+TRAY_ICON_PATH = APP_DIR / "assets" / "sim_ico.ico"
 
 if IS_WINDOWS:
     STARTUP_DIR = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
@@ -126,6 +128,7 @@ def create_startup_shortcut(speaker_on: bool = False):
         f'$sc.TargetPath = "{target_path}"; '
         f"$sc.Arguments = '{arguments}'; "
         f'$sc.WorkingDirectory = "{APP_DIR}"; '
+        f'$sc.IconLocation = "{ICON_PATH}"; '
         '$sc.Description = "Did You Close the Speaker?"; '
         '$sc.Save()'
     )
@@ -324,6 +327,8 @@ class MainWindow(QMainWindow):
         self.setFixedSize(400, 460)
         self.setStyleSheet(STYLE_SHEET)
         self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
+        if TRAY_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(TRAY_ICON_PATH)))
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -581,7 +586,12 @@ class MainWindow(QMainWindow):
 
     def _setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
-        self._update_tray_icon()
+        if TRAY_ICON_PATH.exists():
+            self.tray_icon.setIcon(QIcon(str(TRAY_ICON_PATH)))
+        elif ICON_PATH.exists():
+            self.tray_icon.setIcon(QIcon(str(ICON_PATH)))
+        else:
+            self._update_tray_icon()
 
         tray_menu = QMenu()
 
@@ -611,13 +621,18 @@ class MainWindow(QMainWindow):
         self.tray_icon.show()
 
     def _update_tray_icon(self):
-        color_map = {
-            PlugState.ON: "#27ae60",
-            PlugState.OFF: "#7f8c8d",
-            PlugState.UNKNOWN: "#f39c12",
-            PlugState.ERROR: "#c0392b",
-        }
-        self.tray_icon.setIcon(make_circle_icon(color_map[self.plug_state]))
+        if TRAY_ICON_PATH.exists():
+            self.tray_icon.setIcon(QIcon(str(TRAY_ICON_PATH)))
+        elif ICON_PATH.exists():
+            self.tray_icon.setIcon(QIcon(str(ICON_PATH)))
+        else:
+            color_map = {
+                PlugState.ON: "#27ae60",
+                PlugState.OFF: "#7f8c8d",
+                PlugState.UNKNOWN: "#f39c12",
+                PlugState.ERROR: "#c0392b",
+            }
+            self.tray_icon.setIcon(make_circle_icon(color_map[self.plug_state]))
 
     def _tray_activated(self, reason):
         if reason == QSystemTrayIcon.DoubleClick:

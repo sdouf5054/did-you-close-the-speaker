@@ -1,0 +1,7 @@
+{
+    "tapo_email": "your_tapo_email@example.com",
+    "tapo_password": "your_tapo_password",
+    "plug_ip": "192.168.0.123",
+    "delay_after_power_off_sec": 2,
+    "timeout_sec": 5
+}

@@ -1,0 +1,10 @@
+config.json
+logs/
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+*.spec
+*.egg-info/
+.venv/

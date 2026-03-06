@@ -307,6 +307,7 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._setup_tray()
         self._setup_idle_timer()
+        self._setup_show_event_listener()
 
         # Startup behavior
         if speaker_on_at_startup:
@@ -327,8 +328,8 @@ class MainWindow(QMainWindow):
         self.setFixedSize(400, 460)
         self.setStyleSheet(STYLE_SHEET)
         self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
-        if TRAY_ICON_PATH.exists():
-            self.setWindowIcon(QIcon(str(TRAY_ICON_PATH)))
+        if ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICON_PATH)))
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -516,6 +517,34 @@ class MainWindow(QMainWindow):
         self._idle_check_timer.timeout.connect(self._check_idle)
         if self.settings.get("idle_timer_enabled", False):
             self._idle_check_timer.start(30_000)
+
+    # ----- Single instance show-window listener -----
+
+    def _setup_show_event_listener(self):
+        """
+        Create a Named Event and poll it every 500ms.
+        When a second instance signals it, show this window.
+        Polling cost: negligible (one WaitForSingleObject with 0 timeout).
+        """
+        if not IS_WINDOWS:
+            return
+        self._show_event_handle = ctypes.windll.kernel32.CreateEventW(
+            None, True, False, EVENT_NAME  # manual reset, initially non-signaled
+        )
+        self._show_event_timer = QTimer(self)
+        self._show_event_timer.timeout.connect(self._check_show_event)
+        self._show_event_timer.start(500)
+
+    def _check_show_event(self):
+        """Check if another instance signaled us to show."""
+        if not IS_WINDOWS or not self._show_event_handle:
+            return
+        # WaitForSingleObject with 0 timeout = instant check, no blocking
+        result = ctypes.windll.kernel32.WaitForSingleObject(self._show_event_handle, 0)
+        if result == 0:  # WAIT_OBJECT_0 = signaled
+            ctypes.windll.kernel32.ResetEvent(self._show_event_handle)
+            logger.info("Show signal received from another instance.")
+            self._show_window()
 
     def _get_idle_seconds(self) -> float:
         """Return seconds since last keyboard/mouse input."""
@@ -872,6 +901,35 @@ class MainWindow(QMainWindow):
 
 
 # ---------------------------------------------------------------------------
+# Single instance enforcement
+# ---------------------------------------------------------------------------
+MUTEX_NAME = "Global\\DYCTS_DidYouCloseTheSpeaker"
+EVENT_NAME = "Global\\DYCTS_ShowWindow"
+
+
+def _signal_existing_instance():
+    """Signal the existing instance to show its window via a Named Event."""
+    if not IS_WINDOWS:
+        return
+    handle = ctypes.windll.kernel32.OpenEventW(0x0002, False, EVENT_NAME)  # EVENT_MODIFY_STATE
+    if handle:
+        ctypes.windll.kernel32.SetEvent(handle)
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def _acquire_mutex():
+    """Try to acquire a named mutex. Returns handle if success, None if already running."""
+    if not IS_WINDOWS:
+        return True
+    handle = ctypes.windll.kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    last_err = ctypes.windll.kernel32.GetLastError()
+    if last_err == 183:  # ERROR_ALREADY_EXISTS
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return None
+    return handle
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
@@ -880,6 +938,13 @@ def main():
     parser.add_argument("--startup", action="store_true", help="Launched from Windows startup")
     parser.add_argument("--speaker-on", action="store_true", help="Turn speaker on at launch")
     args = parser.parse_args()
+
+    # Single instance check
+    mutex = _acquire_mutex()
+    if mutex is None:
+        logger.info("Another instance is already running. Signaling it to show.")
+        _signal_existing_instance()
+        sys.exit(0)
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)

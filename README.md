@@ -1,115 +1,165 @@
 # Did You Close the Speaker? 🔊
 
-Safe power management for active studio monitors connected to a **TP-Link Tapo P115** smart plug.
+**Safe power management for active studio monitors** powered by **TP-Link Tapo P115** smart plug.
 
-Turns off your speakers before shutting down, sleeping, or restarting your PC — preventing potentially harmful power-off pops on active monitors.
+Automatically turns off speakers **before** PC shutdown/sleep/restart — preventing damaging power-off pops on active monitors like iLoud Micro/MTMs.
 
-## Why?
 
-Active monitors (like the iLoud Micro/MTM series) can produce audible pops when power is cut abruptly. This tool ensures the smart plug powering your speakers is turned off *before* any system power action, giving the monitors a clean shutdown.
+## Features
+
+| Feature | Status |
+|---------|--------|
+| System tray app with quick actions | ✅ |
+| Safe Shutdown/Sleep/Restart | ✅ |
+| Separate compact Settings window | ✅ |
+| Windows Startup autorun | ✅ |
+| Idle detection (auto speaker off) | ✅ |
+| Auto resume speaker when active | ✅ |
+| Sleep/Shutdown watchdog | ✅ |
+| Single instance support | ✅ |
+| PyInstaller exe build ready | ✅ |
+| CLI fallback (main.py) | ✅ |
 
 ## Quick Start
 
+### 1. Install
 ```bash
-# 1. Clone
-git clone https://github.com/yourusername/did-you-close-the-speaker.git
+git clone <your-repo>
 cd did-you-close-the-speaker
-
-# 2. Install
 pip install -r requirements.txt
-
-# 3. Configure
-cp config.example.json config.json
-# Edit config.json with your Tapo credentials and plug IP
-
-# 4. Use
-python main.py shutdown    # Speaker OFF → PC shutdown
-python main.py sleep       # Speaker OFF → PC sleep
-python main.py restart     # Speaker OFF → PC restart
-python main.py off         # Speaker OFF only
-python main.py on          # Speaker ON only
-python main.py status      # Check plug status
 ```
 
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `shutdown` | Turn off speaker plug, wait, then shutdown |
-| `sleep` | Turn off speaker plug, wait, then sleep |
-| `restart` | Turn off speaker plug, wait, then restart |
-| `off` | Turn off speaker plug only |
-| `on` | Turn on speaker plug only |
-| `status` | Show current plug status |
-
-All power commands accept `--force` to proceed even if the plug control fails:
-
+### 2. Configure
 ```bash
-python main.py shutdown --force
+cp config.example.json config.json
+# Edit with your Tapo P115 IP + account
+```
+
+### 3. Run
+```bash
+# GUI (system tray)
+python gui.py
+
+# Startup (no console window)
+pythonw gui.py --startup
+
+# Startup + auto speaker ON
+pythonw gui.py --startup --speaker-on
+```
+
+## GUI Usage
+
+**Main Window** (400x270 - super compact):
+```
+🔊 Did You Close the Speaker?
+● Status: ON    ↻ Refresh
+[Turn Speaker OFF]
+───────────────
+Shutdown  Sleep  Restart
+───────────────
+⚙️ Settings
+```
+
+**Settings Window** (opens on button click):
+```
+☐ Run at startup
+☐ Run at startup & Speaker ON
+☐ Turn off speaker before PC shutdown
+☐ Turn off speaker when idle: [15min ▼]
+☐ Auto turn on speaker when active
+        [Close]
+```
+
+**System Tray Menu**:
+```
+Show Window
+Speaker OFF ▼
+───────────
+Safe Shutdown
+Safe Sleep  
+Safe Restart
+───────────
+Quit
 ```
 
 ## Configuration
 
-Copy `config.example.json` to `config.json`:
-
+**config.json**:
 ```json
 {
-    "tapo_email": "your_tapo_email@example.com",
-    "tapo_password": "your_tapo_password",
+    "tapo_email": "your@email.com",
+    "tapo_password": "yourpass", 
     "plug_ip": "192.168.0.123",
     "delay_after_power_off_sec": 2,
     "timeout_sec": 5
 }
 ```
 
-| Key | Description |
-|-----|-------------|
-| `tapo_email` | Your TP-Link / Tapo account email |
-| `tapo_password` | Your TP-Link / Tapo account password |
-| `plug_ip` | Local IP address of your Tapo P115 |
-| `delay_after_power_off_sec` | Seconds to wait after turning off plug before power action |
-| `timeout_sec` | Timeout for Tapo API calls |
+**settings.json** (auto-generated):
+```json
+{
+    "start_with_windows": false,
+    "speaker_on_at_startup": false,
+    "watchdog_enabled": false,
+    "idle_timer_enabled": false,
+    "idle_timer_minutes": 15,
+    "idle_auto_on": false
+}
+```
 
-> **Tip:** Assign a static IP to your P115 in your router's DHCP settings for reliability.
-
-## Desktop Shortcut (Windows)
-
-For quick access, create a shortcut on your desktop:
-
-1. Right-click Desktop → New → Shortcut
-2. Location: `pythonw.exe "C:\path\to\did-you-close-the-speaker\main.py" shutdown`
-3. Name it "Safe Shutdown"
-
-Or if using a PyInstaller build:
+## Build Standalone EXE
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --name dycts main.py
-# Creates dist/dycts.exe
+pyinstaller gui.py \
+    -n DYCTSpeaker \
+    -w \
+    --icon=assets/ico.ico \
+    --add-data "assets;assets" \
+    --add-data "config.json;." \
+    --add-data "settings.json;."
 ```
 
-Then point the shortcut to `dist/dycts.exe shutdown`.
+**Result**: `dist/DYCTSpeaker.exe` (single file, portable)
 
-## Sleep Note
+## CLI Fallback (main.py)
 
-Windows `SetSuspendState` may hibernate instead of sleep if hibernate is enabled. To ensure sleep mode:
-
-```powershell
-# Run as Administrator (one-time)
-powercfg /h off
+```bash
+python main.py shutdown    # Speaker OFF → Shutdown
+python main.py sleep       # Speaker OFF → Sleep  
+python main.py restart     # Speaker OFF → Restart
+python main.py off         # Speaker OFF only
+python main.py status      # Check status
 ```
+
+Add `--force` to skip speaker control errors.
 
 ## Logs
 
-All actions are logged to `logs/dycts.log`.
+```
+logs/
+└── dycts.log     # All actions + errors
+```
+
+## Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Startup shortcut wrong icon | Delete `DYCTSpeaker.lnk`, toggle "Run at startup" |
+| Tapo connection fails | Check IP, credentials, network |
+| Hibernate instead of sleep | `powercfg /h off` (Admin) |
+| Multiple instances | Single-instance mutex prevents |
 
 ## Roadmap
 
-- [x] v1: CLI with safe shutdown / sleep / restart / manual on-off
-- [ ] v1.5: PyInstaller exe build
-- [ ] v2: System tray app with quick actions
-- [ ] v3: Windows shutdown event watchdog (auto-detect shutdown and intervene)
+- [x] CLI power management
+- [x] **System tray GUI + Settings split**
+- [x] Startup integration + idle detection
+- [x] Watchdog + single instance
+- [ ] Hotkey support
+- [ ] macOS/Linux support (I don't need this now btw)
+
 
 ## License
 
-MIT
+MIT [LICENSE](LICENSE)

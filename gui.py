@@ -263,8 +263,40 @@ QCheckBox::indicator:checked {
     background-color: #2980b9;
     border-color: #3498db;
 }
+QPushButton#settingsBtn {
+    background-color: #2a2a4a;
+    color: #cccccc;
+    font-size: 12px;
+    padding: 8px 16px;
+}
+QPushButton#settingsBtn:hover {
+    background-color: #3a3a5c;
+    color: #ffffff;
+}
 QFrame#separator {
     background-color: #2a2a4a;
+}
+QMessageBox {
+    background-color: #1a1a2e;
+    color: #e0e0e0;
+}
+QMessageBox QLabel {
+    color: #e0e0e0;
+    font-size: 12px;
+}
+QMessageBox QPushButton {
+    background-color: #0f3460;
+    color: #ffffff;
+    border: none;
+    border-radius: 4px;
+    padding: 8px 16px;
+    min-width: 80px;
+}
+QMessageBox QPushButton:hover {
+    background-color: #1a4a7a;
+}
+QMessageBox QPushButton:pressed {
+    background-color: #0a2b50;
 }
 """
 
@@ -287,6 +319,167 @@ def _make_separator() -> QFrame:
     sep.setFixedHeight(1)
     sep.setFrameShape(QFrame.HLine)
     return sep
+
+
+# ---------------------------------------------------------------------------
+# Settings window
+# ---------------------------------------------------------------------------
+
+
+class SettingsWindow(QMainWindow):
+    """Separate settings window opened from the main window."""
+
+    def __init__(self, parent: "MainWindow", settings: dict, idle_timer: QTimer):
+        super().__init__(parent)
+        self._parent = parent
+        self.settings = settings          # shared reference — mutations are live
+        self._idle_timer = idle_timer
+        self._setup_ui()
+
+    # ----- UI -----
+
+    def _setup_ui(self):
+        self.setWindowTitle("설정")
+        self.setFixedSize(370, 290)
+        self.setStyleSheet(STYLE_SHEET)
+        if ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICON_PATH)))
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(10)
+
+        # --- Startup ---
+        self.chk_startup = QCheckBox("컴퓨터 시작 시 실행")
+        self.chk_startup.setChecked(self.settings["start_with_windows"])
+        self.chk_startup.stateChanged.connect(self._on_startup_changed)
+        layout.addWidget(self.chk_startup)
+
+        self.chk_startup_speaker = QCheckBox("컴퓨터 시작 시 실행 및 Speaker ON")
+        self.chk_startup_speaker.setChecked(self.settings["speaker_on_at_startup"])
+        self.chk_startup_speaker.setEnabled(self.settings["start_with_windows"])
+        self.chk_startup_speaker.stateChanged.connect(self._on_startup_speaker_changed)
+        layout.addWidget(self.chk_startup_speaker)
+
+        # --- Watchdog ---
+        self.chk_watchdog = QCheckBox("PC 종료/다시 시작 전에 스피커 먼저 끄기")
+        self.chk_watchdog.setChecked(self.settings["watchdog_enabled"])
+        self.chk_watchdog.stateChanged.connect(self._on_watchdog_changed)
+        layout.addWidget(self.chk_watchdog)
+
+        layout.addWidget(_make_separator())
+
+        # --- Idle timer row ---
+        idle_row = QHBoxLayout()
+        idle_row.setSpacing(6)
+
+        self.chk_idle = QCheckBox("입력 없으면 스피커 끄기:")
+        self.chk_idle.setChecked(self.settings["idle_timer_enabled"])
+        self.chk_idle.stateChanged.connect(self._on_idle_changed)
+        idle_row.addWidget(self.chk_idle)
+
+        self.combo_idle = QComboBox()
+        self.combo_idle.addItems(IDLE_OPTIONS)
+        current_val = self.settings["idle_timer_minutes"]
+        if current_val in IDLE_VALUES:
+            self.combo_idle.setCurrentIndex(IDLE_VALUES.index(current_val))
+        self.combo_idle.setEnabled(self.settings["idle_timer_enabled"])
+        self.combo_idle.setFixedWidth(70)
+        self.combo_idle.setStyleSheet(COMBO_STYLE)
+        self.combo_idle.currentIndexChanged.connect(self._on_idle_time_changed)
+        idle_row.addWidget(self.combo_idle)
+        idle_row.addStretch()
+        layout.addLayout(idle_row)
+
+        self.chk_idle_auto_on = QCheckBox("입력 감지 시 스피커 자동 켜기")
+        self.chk_idle_auto_on.setChecked(self.settings["idle_auto_on"])
+        self.chk_idle_auto_on.setEnabled(self.settings["idle_timer_enabled"])
+        self.chk_idle_auto_on.stateChanged.connect(self._on_idle_auto_on_changed)
+        layout.addWidget(self.chk_idle_auto_on)
+
+        layout.addStretch()
+
+        # --- Close button ---
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        close_btn = QPushButton("닫기")
+        close_btn.setFixedWidth(80)
+        close_btn.clicked.connect(self.close)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    # ----- Handlers (same logic as the original MainWindow handlers) -----
+
+    def _on_startup_changed(self, state):
+        enabled = state == Qt.Checked
+        self.settings["start_with_windows"] = enabled
+        self.chk_startup_speaker.setEnabled(enabled)
+        if not enabled:
+            self.chk_startup_speaker.setChecked(False)
+            self.settings["speaker_on_at_startup"] = False
+            remove_startup_shortcut()
+        else:
+            create_startup_shortcut(speaker_on=self.settings["speaker_on_at_startup"])
+        save_settings(self.settings)
+
+    def _on_startup_speaker_changed(self, state):
+        enabled = state == Qt.Checked
+        self.settings["speaker_on_at_startup"] = enabled
+        if self.settings["start_with_windows"]:
+            create_startup_shortcut(speaker_on=enabled)
+        save_settings(self.settings)
+
+    def _on_watchdog_changed(self, state):
+        enabled = state == Qt.Checked
+        self.settings["watchdog_enabled"] = enabled
+        save_settings(self.settings)
+        logger.info(f"Watchdog {'enabled' if enabled else 'disabled'}")
+
+    def _on_idle_changed(self, state):
+        enabled = state == Qt.Checked
+        self.settings["idle_timer_enabled"] = enabled
+        self.combo_idle.setEnabled(enabled)
+        self.chk_idle_auto_on.setEnabled(enabled)
+        if enabled:
+            self._idle_timer.start(1_000)
+        else:
+            self._idle_timer.stop()
+        save_settings(self.settings)
+        logger.info(f"Idle timer {'enabled' if enabled else 'disabled'}")
+
+    def _on_idle_time_changed(self, index):
+        if 0 <= index < len(IDLE_VALUES):
+            self.settings["idle_timer_minutes"] = IDLE_VALUES[index]
+            save_settings(self.settings)
+            logger.info(f"Idle timer set to {IDLE_VALUES[index]} minutes")
+
+    def _on_idle_auto_on_changed(self, state):
+        enabled = state == Qt.Checked
+        self.settings["idle_auto_on"] = enabled
+        save_settings(self.settings)
+
+    # ----- Close -----
+
+    def closeEvent(self, event):
+        self._parent._settings_window = None
+        event.accept()
+
+
+# ---------------------------------------------------------------------------
+# Settings window
+# ---------------------------------------------------------------------------
+COMBO_STYLE = (
+    "QComboBox { background-color: #2a2a4a; color: #cccccc; border: 1px solid #555577; "
+    "border-radius: 3px; padding: 2px 6px; font-size: 11px; }"
+    "QComboBox::drop-down { border: none; }"
+    "QComboBox QAbstractItemView { background-color: #2a2a4a; color: #cccccc; "
+    "selection-background-color: #2980b9; }"
+)
+
+IDLE_OPTIONS = ["1분", "3분", "5분", "10분", "15분", "20분", "25분", "30분", "45분", "60분"]
+IDLE_VALUES  = [1, 3, 5, 10, 15, 20, 25, 30, 45, 60]
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +519,7 @@ class MainWindow(QMainWindow):
 
     def _setup_ui(self):
         self.setWindowTitle("Did You Close the Speaker?")
-        self.setFixedSize(400, 460)
+        self.setFixedSize(400, 270)
         self.setStyleSheet(STYLE_SHEET)
         self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
         if ICON_PATH.exists():
@@ -391,121 +584,24 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(_make_separator())
 
-        # --- Settings ---
-        settings_label = QLabel("Settings")
-        settings_label.setObjectName("sectionLabel")
-        settings_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(settings_label)
-
-        self.chk_startup = QCheckBox("컴퓨터 시작 시 실행")
-        self.chk_startup.setChecked(self.settings["start_with_windows"])
-        self.chk_startup.stateChanged.connect(self._on_startup_changed)
-        layout.addWidget(self.chk_startup)
-
-        self.chk_startup_speaker = QCheckBox("컴퓨터 시작 시 실행 및 Speaker ON")
-        self.chk_startup_speaker.setChecked(self.settings["speaker_on_at_startup"])
-        self.chk_startup_speaker.setEnabled(self.settings["start_with_windows"])
-        self.chk_startup_speaker.stateChanged.connect(self._on_startup_speaker_changed)
-        layout.addWidget(self.chk_startup_speaker)
-
-        self.chk_watchdog = QCheckBox("PC 종료/다시 시작 전에 스피커 먼저 끄기")
-        self.chk_watchdog.setChecked(self.settings["watchdog_enabled"])
-        self.chk_watchdog.stateChanged.connect(self._on_watchdog_changed)
-        layout.addWidget(self.chk_watchdog)
-
-        # Idle timer row
-        idle_row = QHBoxLayout()
-        idle_row.setSpacing(6)
-
-        self.chk_idle = QCheckBox("입력 없으면 스피커 끄기:")
-        self.chk_idle.setChecked(self.settings["idle_timer_enabled"])
-        self.chk_idle.stateChanged.connect(self._on_idle_changed)
-        idle_row.addWidget(self.chk_idle)
-
-        IDLE_OPTIONS = ["1분","5분", "10분", "15분", "20분", "25분", "30분", "45분", "60분"]
-        IDLE_VALUES = [1, 5, 10, 15, 20, 25, 30, 45, 60]
-
-        self.combo_idle = QComboBox()
-        self.combo_idle.addItems(IDLE_OPTIONS)
-        current_val = self.settings["idle_timer_minutes"]
-        if current_val in IDLE_VALUES:
-            self.combo_idle.setCurrentIndex(IDLE_VALUES.index(current_val))
-        self.combo_idle.setEnabled(self.settings["idle_timer_enabled"])
-        self.combo_idle.setFixedWidth(70)
-        self.combo_idle.setStyleSheet(
-            "QComboBox { background-color: #2a2a4a; color: #cccccc; border: 1px solid #555577; "
-            "border-radius: 3px; padding: 2px 6px; font-size: 11px; }"
-            "QComboBox::drop-down { border: none; }"
-            "QComboBox QAbstractItemView { background-color: #2a2a4a; color: #cccccc; "
-            "selection-background-color: #2980b9; }"
-        )
-        self.combo_idle.currentIndexChanged.connect(self._on_idle_time_changed)
-        idle_row.addWidget(self.combo_idle)
-        idle_row.addStretch()
-        layout.addLayout(idle_row)
-
-        self.chk_idle_auto_on = QCheckBox("입력 감지 시 스피커 자동 켜기")
-        self.chk_idle_auto_on.setChecked(self.settings["idle_auto_on"])
-        self.chk_idle_auto_on.setEnabled(self.settings["idle_timer_enabled"])
-        self.chk_idle_auto_on.stateChanged.connect(self._on_idle_auto_on_changed)
-        layout.addWidget(self.chk_idle_auto_on)
+        # --- Settings button ---
+        self._settings_window = None
+        settings_btn = QPushButton("⚙️  설정")
+        settings_btn.setObjectName("settingsBtn")
+        settings_btn.clicked.connect(self._open_settings)
+        layout.addWidget(settings_btn)
 
         layout.addStretch()
 
-    # ----- Settings handlers -----
+    # ----- Settings window -----
 
-    def _on_startup_changed(self, state):
-        enabled = state == Qt.Checked
-        self.settings["start_with_windows"] = enabled
-        self.chk_startup_speaker.setEnabled(enabled)
-
-        if not enabled:
-            self.chk_startup_speaker.setChecked(False)
-            self.settings["speaker_on_at_startup"] = False
-            remove_startup_shortcut()
+    def _open_settings(self):
+        if self._settings_window is None or not self._settings_window.isVisible():
+            self._settings_window = SettingsWindow(self, self.settings, self._idle_check_timer)
+            self._settings_window.show()
         else:
-            create_startup_shortcut(speaker_on=self.settings["speaker_on_at_startup"])
-
-        save_settings(self.settings)
-
-    def _on_startup_speaker_changed(self, state):
-        enabled = state == Qt.Checked
-        self.settings["speaker_on_at_startup"] = enabled
-
-        if self.settings["start_with_windows"]:
-            create_startup_shortcut(speaker_on=enabled)
-
-        save_settings(self.settings)
-
-    def _on_watchdog_changed(self, state):
-        enabled = state == Qt.Checked
-        self.settings["watchdog_enabled"] = enabled
-        save_settings(self.settings)
-        logger.info(f"Watchdog {'enabled' if enabled else 'disabled'}")
-
-    def _on_idle_changed(self, state):
-        enabled = state == Qt.Checked
-        self.settings["idle_timer_enabled"] = enabled
-        self.combo_idle.setEnabled(enabled)
-        self.chk_idle_auto_on.setEnabled(enabled)
-        if enabled:
-            self._idle_check_timer.start(1_000)
-        else:
-            self._idle_check_timer.stop()
-        save_settings(self.settings)
-        logger.info(f"Idle timer {'enabled' if enabled else 'disabled'}")
-
-    def _on_idle_time_changed(self, index):
-        values = [1, 5, 10, 15, 20, 25, 30, 45, 60]
-        if 0 <= index < len(values):
-            self.settings["idle_timer_minutes"] = values[index]
-            save_settings(self.settings)
-            logger.info(f"Idle timer set to {values[index]} minutes")
-
-    def _on_idle_auto_on_changed(self, state):
-        enabled = state == Qt.Checked
-        self.settings["idle_auto_on"] = enabled
-        save_settings(self.settings)
+            self._settings_window.activateWindow()
+            self._settings_window.raise_()
 
     # ----- Idle timer -----
 

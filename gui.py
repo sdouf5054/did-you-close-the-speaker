@@ -8,6 +8,7 @@ import os
 import asyncio
 import logging
 import json
+import threading
 from pathlib import Path
 from enum import Enum
 
@@ -483,6 +484,42 @@ IDLE_VALUES  = [1, 3, 5, 10, 15, 20, 25, 30, 45, 60]
 
 
 # ---------------------------------------------------------------------------
+# Watchdog shutdown helper — runs turn-off in a background thread
+# ---------------------------------------------------------------------------
+WATCHDOG_TIMEOUT = 2  # seconds — aggressive but realistic for LAN smart plugs
+
+
+class _WatchdogThread(threading.Thread):
+    """
+    Fires turn-off in a daemon thread so that nativeEvent can return
+    immediately to the OS.  Use the built-in Event to let WM_ENDSESSION
+    know whether the work finished.
+    """
+
+    def __init__(self, controller: TapoController):
+        super().__init__(daemon=True)
+        self._controller = controller
+        self.done = threading.Event()
+        self.success = False
+
+    def run(self):
+        try:
+            quick = TapoController(
+                ip=self._controller.ip,
+                email=self._controller.email,
+                password=self._controller.password,
+                timeout=WATCHDOG_TIMEOUT,
+            )
+            asyncio.run(quick.turn_off())
+            self.success = True
+            logger.info("Watchdog thread: speaker OFF succeeded.")
+        except Exception as e:
+            logger.error(f"Watchdog thread: speaker OFF failed — {e}")
+        finally:
+            self.done.set()
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
@@ -497,6 +534,7 @@ class MainWindow(QMainWindow):
         self._busy = False
         self._shutdown_intercepted = False
         self._idle_turned_off = False  # tracks if idle timer turned off the speaker
+        self._watchdog_thread: _WatchdogThread | None = None  # background watchdog
 
         self._setup_ui()
         self._setup_tray()
@@ -783,56 +821,102 @@ class MainWindow(QMainWindow):
         self.hide()
 
     # ----- Native event handling (wake + shutdown watchdog) -----
+    #
+    # DESIGN:
+    #   WM_QUERYENDSESSION  →  Start turn-off in background thread
+    #                           Return True,1 immediately (= "OK to shut down")
+    #   WM_ENDSESSION       →  Wait for background thread to finish (up to 2s)
+    #                           Return True,0 (= acknowledged)
+    #   PBT_APMSUSPEND      →  Same background-thread approach for sleep
+    #
+    # This ensures the OS never sees us as "not responding" because we
+    # return from the Windows message handler instantly.
+    # -----------------------------------------------------------------
+
+    def _start_watchdog_thread(self):
+        """Launch a background thread to turn off the speaker.
+        Safe to call multiple times — skips if one is already running."""
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            logger.info("Watchdog thread already running, skipping duplicate launch.")
+            return
+        self._watchdog_thread = _WatchdogThread(self.controller)
+        self._watchdog_thread.start()
+        logger.info("Watchdog background thread started.")
+
+    def _wait_for_watchdog(self, timeout: float = 2.0):
+        """Block until the watchdog thread finishes or timeout expires.
+        Called from WM_ENDSESSION where brief blocking is acceptable."""
+        if self._watchdog_thread is not None:
+            self._watchdog_thread.done.wait(timeout=timeout)
+            if self._watchdog_thread.success:
+                logger.info("Watchdog completed successfully before session end.")
+            else:
+                logger.warning("Watchdog did not complete successfully (timeout or error).")
 
     def nativeEvent(self, event_type, message):
         if IS_WINDOWS and event_type == b"windows_generic_MSG":
             msg = ctypes.wintypes.MSG.from_address(int(message))
 
-            # Wake from sleep/hibernate
+            # ── Wake from sleep/hibernate ──
             if msg.message == WM_POWERBROADCAST:
                 if msg.wParam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
                     logger.info("System resumed from sleep/hibernate.")
                     self._set_busy(False)
                     self.plug_state = PlugState.UNKNOWN
                     self._idle_turned_off = False
+                    self._shutdown_intercepted = False
                     QTimer.singleShot(3000, self.refresh_status)
-                if msg.wParam == PBT_APMSUSPEND:
-                    logger.info("System entering sleep — turning off speaker.")
-                    try:
-                        asyncio.run(self._watchdog_turn_off())
-                        logger.info("Speaker OFF before sleep.")
-                    except Exception as e:
-                        logger.error(f"Sleep watchdog failed: {e}")         
-                               
-            # Shutdown/restart watchdog
+
+                # ── Entering sleep ──
+                elif msg.wParam == PBT_APMSUSPEND:
+                    if self.settings.get("watchdog_enabled", False):
+                        logger.info("PBT_APMSUSPEND — watchdog turning off speaker.")
+                        self._start_watchdog_thread()
+                        # Give the thread a brief moment to finish, but don't
+                        # block too long — OS expects a quick return here too.
+                        if self._watchdog_thread is not None:
+                            self._watchdog_thread.done.wait(timeout=WATCHDOG_TIMEOUT + 0.5)
+                            if self._watchdog_thread.success:
+                                logger.info("Speaker OFF before sleep.")
+                            else:
+                                logger.warning("Speaker OFF before sleep may have failed.")
+
+            # ── Shutdown/restart: phase 1 — "may I shut down?" ──
             elif msg.message == WM_QUERYENDSESSION:
                 if self.settings.get("watchdog_enabled", False):
-                    logger.info("WM_QUERYENDSESSION — watchdog turning off speaker.")
+                    logger.info("WM_QUERYENDSESSION — launching watchdog thread.")
                     self._shutdown_intercepted = True
-                    try:
-                        asyncio.run(self._watchdog_turn_off())
-                        logger.info("Watchdog: speaker OFF before shutdown.")
-                    except Exception as e:
-                        logger.error(f"Watchdog failed: {e}")
+                    self._start_watchdog_thread()
+                # Return immediately: (handled=True, result=1) = "yes, OK to shut down"
+                return True, 1
 
+            # ── Shutdown/restart: phase 2 — "session is ending now" ──
             elif msg.message == WM_ENDSESSION:
-                if msg.wParam and self.settings.get("watchdog_enabled", False):
-                    if not self._shutdown_intercepted:
-                        logger.info("WM_ENDSESSION — last-chance speaker off.")
-                        try:
-                            asyncio.run(self._watchdog_turn_off())
-                        except Exception as e:
-                            logger.error(f"Watchdog (ENDSESSION) failed: {e}")
+                if msg.wParam:
+                    # wParam != 0 means the session IS ending.
+                    if self.settings.get("watchdog_enabled", False):
+                        if self._shutdown_intercepted:
+                            # Thread was started in QUERYENDSESSION — wait for it.
+                            logger.info("WM_ENDSESSION — waiting for watchdog thread.")
+                            self._wait_for_watchdog(timeout=WATCHDOG_TIMEOUT + 0.5)
+                        else:
+                            # Rare: QUERYENDSESSION was missed. Last-chance attempt.
+                            logger.info("WM_ENDSESSION — last-chance watchdog launch.")
+                            self._start_watchdog_thread()
+                            self._wait_for_watchdog(timeout=WATCHDOG_TIMEOUT + 0.5)
+                # Acknowledge session end: (handled=True, result=0)
+                return True, 0
 
         return super().nativeEvent(event_type, message)
 
+    # Legacy helper kept for reference — no longer called from nativeEvent.
     async def _watchdog_turn_off(self):
         """Quick turn-off with aggressive timeout for shutdown scenarios."""
         quick = TapoController(
             ip=self.controller.ip,
             email=self.controller.email,
             password=self.controller.password,
-            timeout=3,
+            timeout=WATCHDOG_TIMEOUT,
         )
         await quick.turn_off()
 

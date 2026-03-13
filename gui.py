@@ -8,6 +8,7 @@ import os
 import asyncio
 import logging
 import json
+import time
 import threading
 from pathlib import Path
 from enum import Enum
@@ -42,6 +43,60 @@ if IS_WINDOWS:
 from config import load_config
 from tapo_control import TapoController
 from power import shutdown_windows, sleep_windows, restart_windows
+
+# ---------------------------------------------------------------------------
+# Audio output detection (pycaw / WASAPI peak meter)
+# ---------------------------------------------------------------------------
+try:
+    from pycaw.pycaw import AudioUtilities, IAudioMeterInformation, IMMDevice
+    from ctypes import cast, POINTER
+    from comtypes import CLSCTX_ALL
+    PYCAW_AVAILABLE = True
+except ImportError:
+    PYCAW_AVAILABLE = False
+
+# Threshold for considering audio as "playing".
+# Values below this are treated as silence (e.g. noise floor, idle loopback).
+_AUDIO_PEAK_THRESHOLD = 0.001
+
+# Cache the meter interface — GetSpeakers() + Activate() is expensive to repeat every second.
+_audio_meter_cache: object | None = None
+
+
+def _get_audio_meter():
+    """Get or create cached IAudioMeterInformation interface."""
+    global _audio_meter_cache
+    if _audio_meter_cache is None and PYCAW_AVAILABLE:
+        try:
+            speakers = AudioUtilities.GetSpeakers()
+            imm_device = speakers._dev.QueryInterface(IMMDevice)
+            interface = imm_device.Activate(IAudioMeterInformation._iid_, CLSCTX_ALL, None)
+            _audio_meter_cache = cast(interface, POINTER(IAudioMeterInformation))
+        except Exception:
+            _audio_meter_cache = None
+    return _audio_meter_cache
+
+
+def is_audio_playing() -> bool:
+    """
+    Check if audio is actually being output by reading the system peak meter.
+    Returns True if the peak level exceeds the silence threshold.
+    Returns False if pycaw is not available, on error, or silence.
+    """
+    if not PYCAW_AVAILABLE:
+        return False
+    try:
+        meter = _get_audio_meter()
+        if meter is None:
+            return False
+        peak = meter.GetPeakValue()
+        return peak > _AUDIO_PEAK_THRESHOLD
+    except Exception:
+        # Meter may become invalid after audio device change — reset cache
+        global _audio_meter_cache
+        _audio_meter_cache = None
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -82,6 +137,7 @@ DEFAULT_SETTINGS = {
     "idle_timer_enabled": False,
     "idle_timer_minutes": 15,
     "idle_auto_on": False,
+    "idle_audio_aware": False,
 }
 
 
@@ -341,7 +397,7 @@ class SettingsWindow(QMainWindow):
 
     def _setup_ui(self):
         self.setWindowTitle("Settings")
-        self.setFixedSize(370, 290)
+        self.setFixedSize(370, 320)
         self.setStyleSheet(STYLE_SHEET)
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
@@ -400,6 +456,16 @@ class SettingsWindow(QMainWindow):
         self.chk_idle_auto_on.stateChanged.connect(self._on_idle_auto_on_changed)
         layout.addWidget(self.chk_idle_auto_on)
 
+        # --- Audio-aware idle ---
+        self.chk_audio_aware = QCheckBox("Keep speaker on while audio is playing")
+        self.chk_audio_aware.setChecked(self.settings["idle_audio_aware"])
+        self.chk_audio_aware.setEnabled(self.settings["idle_timer_enabled"])
+        self.chk_audio_aware.stateChanged.connect(self._on_audio_aware_changed)
+        if not PYCAW_AVAILABLE:
+            self.chk_audio_aware.setEnabled(False)
+            self.chk_audio_aware.setToolTip("Requires pycaw library (pip install pycaw)")
+        layout.addWidget(self.chk_audio_aware)
+
         layout.addStretch()
 
         # --- Close button ---
@@ -411,7 +477,7 @@ class SettingsWindow(QMainWindow):
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
 
-    # ----- Handlers (same logic as the original MainWindow handlers) -----
+    # ----- Handlers -----
 
     def _on_startup_changed(self, state):
         enabled = state == Qt.Checked
@@ -443,6 +509,8 @@ class SettingsWindow(QMainWindow):
         self.settings["idle_timer_enabled"] = enabled
         self.combo_idle.setEnabled(enabled)
         self.chk_idle_auto_on.setEnabled(enabled)
+        # Audio-aware checkbox: enabled only when idle timer is on AND pycaw is available
+        self.chk_audio_aware.setEnabled(enabled and PYCAW_AVAILABLE)
         if enabled:
             self._idle_timer.start(1_000)
         else:
@@ -460,6 +528,12 @@ class SettingsWindow(QMainWindow):
         enabled = state == Qt.Checked
         self.settings["idle_auto_on"] = enabled
         save_settings(self.settings)
+
+    def _on_audio_aware_changed(self, state):
+        enabled = state == Qt.Checked
+        self.settings["idle_audio_aware"] = enabled
+        save_settings(self.settings)
+        logger.info(f"Audio-aware idle {'enabled' if enabled else 'disabled'}")
 
     # ----- Close -----
 
@@ -534,6 +608,8 @@ class MainWindow(QMainWindow):
         self._busy = False
         self._shutdown_intercepted = False
         self._idle_turned_off = False  # tracks if idle timer turned off the speaker
+        self._audio_was_playing = False  # previous tick's audio state
+        self._audio_stop_time: float | None = None  # monotonic time when audio stopped
         self._watchdog_thread: _WatchdogThread | None = None  # background watchdog
 
         self._setup_ui()
@@ -645,7 +721,7 @@ class MainWindow(QMainWindow):
 
     def _setup_idle_timer(self):
         """
-        Poll GetLastInputInfo every 30 seconds.
+        Poll GetLastInputInfo every second.
         Only runs when idle timer is enabled — zero overhead when off.
         """
         self._idle_check_timer = QTimer(self)
@@ -693,12 +769,54 @@ class MainWindow(QMainWindow):
         return 0.0
 
     def _check_idle(self):
-        """Called every 30s by QTimer. Checks idle state and acts."""
+        """Called every 1s by QTimer. Checks idle state and acts."""
         if not self.settings.get("idle_timer_enabled", False):
             return
 
-        idle_sec = self._get_idle_seconds()
         threshold_sec = self.settings.get("idle_timer_minutes", 15) * 60
+        audio_aware = self.settings.get("idle_audio_aware", False)
+        audio_playing = audio_aware and is_audio_playing()
+
+        # Track audio state transitions
+        if audio_aware:
+            if audio_playing and not self._audio_was_playing:
+                # Audio just started — clear stop time
+                self._audio_stop_time = None
+            elif not audio_playing and self._audio_was_playing:
+                # Audio just stopped — record the moment
+                self._audio_stop_time = time.monotonic()
+                logger.info("Audio stopped. Idle timer starts from now.")
+            self._audio_was_playing = audio_playing
+
+        # Audio is playing — skip idle entirely
+        if audio_playing:
+            if self._idle_turned_off:
+                # Audio started playing after idle turn-off — auto-on if enabled
+                if self.settings.get("idle_auto_on", False):
+                    if self.plug_state == PlugState.OFF and not self._busy:
+                        logger.info("Audio playing after idle turn-off. Auto turning speaker ON.")
+                        self._idle_turned_off = False
+                        self._set_busy(True)
+                        self.status_label.setText("● Audio detected — turning ON...")
+                        self.status_label.setStyleSheet("color: #f39c12;")
+                        self._run_async(
+                            self.controller.turn_on,
+                            on_done=lambda _: self._on_toggle_done(True),
+                            on_error=self._on_toggle_error,
+                        )
+                else:
+                    self._idle_turned_off = False
+            return
+
+        # Determine effective idle seconds
+        input_idle_sec = self._get_idle_seconds()
+
+        if audio_aware and self._audio_stop_time is not None:
+            # Use the shorter of: time since last input, time since audio stopped
+            audio_idle_sec = time.monotonic() - self._audio_stop_time
+            idle_sec = min(input_idle_sec, audio_idle_sec)
+        else:
+            idle_sec = input_idle_sec
 
         if threshold_sec - 5 <= idle_sec < threshold_sec and not self._idle_turned_off:
             logger.info(f"Idle check: {idle_sec:.0f}s / {threshold_sec}s")
@@ -719,7 +837,6 @@ class MainWindow(QMainWindow):
         else:
             # User is active
             if self._idle_turned_off and self.settings.get("idle_auto_on", False):
-                # Auto turn on when user returns
                 if self.plug_state == PlugState.OFF and not self._busy:
                     logger.info("User returned from idle. Auto turning speaker ON.")
                     self._idle_turned_off = False
@@ -732,7 +849,6 @@ class MainWindow(QMainWindow):
                         on_error=self._on_toggle_error,
                     )
             elif self._idle_turned_off and not self.settings.get("idle_auto_on", False):
-                # Reset flag so idle can trigger again next time
                 self._idle_turned_off = False
 
     def _on_idle_off_done(self):
@@ -821,21 +937,9 @@ class MainWindow(QMainWindow):
         self.hide()
 
     # ----- Native event handling (wake + shutdown watchdog) -----
-    #
-    # DESIGN:
-    #   WM_QUERYENDSESSION  →  Start turn-off in background thread
-    #                           Return True,1 immediately (= "OK to shut down")
-    #   WM_ENDSESSION       →  Wait for background thread to finish (up to 2s)
-    #                           Return True,0 (= acknowledged)
-    #   PBT_APMSUSPEND      →  Same background-thread approach for sleep
-    #
-    # This ensures the OS never sees us as "not responding" because we
-    # return from the Windows message handler instantly.
-    # -----------------------------------------------------------------
 
     def _start_watchdog_thread(self):
-        """Launch a background thread to turn off the speaker.
-        Safe to call multiple times — skips if one is already running."""
+        """Launch a background thread to turn off the speaker."""
         if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
             logger.info("Watchdog thread already running, skipping duplicate launch.")
             return
@@ -844,8 +948,7 @@ class MainWindow(QMainWindow):
         logger.info("Watchdog background thread started.")
 
     def _wait_for_watchdog(self, timeout: float = 2.0):
-        """Block until the watchdog thread finishes or timeout expires.
-        Called from WM_ENDSESSION where brief blocking is acceptable."""
+        """Block until the watchdog thread finishes or timeout expires."""
         if self._watchdog_thread is not None:
             self._watchdog_thread.done.wait(timeout=timeout)
             if self._watchdog_thread.success:
@@ -864,6 +967,8 @@ class MainWindow(QMainWindow):
                     self._set_busy(False)
                     self.plug_state = PlugState.UNKNOWN
                     self._idle_turned_off = False
+                    self._audio_was_playing = False
+                    self._audio_stop_time = None
                     self._shutdown_intercepted = False
                     QTimer.singleShot(3000, self.refresh_status)
 
@@ -872,8 +977,6 @@ class MainWindow(QMainWindow):
                     if self.settings.get("watchdog_enabled", False):
                         logger.info("PBT_APMSUSPEND — watchdog turning off speaker.")
                         self._start_watchdog_thread()
-                        # Give the thread a brief moment to finish, but don't
-                        # block too long — OS expects a quick return here too.
                         if self._watchdog_thread is not None:
                             self._watchdog_thread.done.wait(timeout=WATCHDOG_TIMEOUT + 0.5)
                             if self._watchdog_thread.success:
@@ -881,35 +984,30 @@ class MainWindow(QMainWindow):
                             else:
                                 logger.warning("Speaker OFF before sleep may have failed.")
 
-            # ── Shutdown/restart: phase 1 — "may I shut down?" ──
+            # ── Shutdown/restart: phase 1 ──
             elif msg.message == WM_QUERYENDSESSION:
                 if self.settings.get("watchdog_enabled", False):
                     logger.info("WM_QUERYENDSESSION — launching watchdog thread.")
                     self._shutdown_intercepted = True
                     self._start_watchdog_thread()
-                # Return immediately: (handled=True, result=1) = "yes, OK to shut down"
                 return True, 1
 
-            # ── Shutdown/restart: phase 2 — "session is ending now" ──
+            # ── Shutdown/restart: phase 2 ──
             elif msg.message == WM_ENDSESSION:
                 if msg.wParam:
-                    # wParam != 0 means the session IS ending.
                     if self.settings.get("watchdog_enabled", False):
                         if self._shutdown_intercepted:
-                            # Thread was started in QUERYENDSESSION — wait for it.
                             logger.info("WM_ENDSESSION — waiting for watchdog thread.")
                             self._wait_for_watchdog(timeout=WATCHDOG_TIMEOUT + 0.5)
                         else:
-                            # Rare: QUERYENDSESSION was missed. Last-chance attempt.
                             logger.info("WM_ENDSESSION — last-chance watchdog launch.")
                             self._start_watchdog_thread()
                             self._wait_for_watchdog(timeout=WATCHDOG_TIMEOUT + 0.5)
-                # Acknowledge session end: (handled=True, result=0)
                 return True, 0
 
         return super().nativeEvent(event_type, message)
 
-    # Legacy helper kept for reference — no longer called from nativeEvent.
+    # Legacy helper kept for reference
     async def _watchdog_turn_off(self):
         """Quick turn-off with aggressive timeout for shutdown scenarios."""
         quick = TapoController(

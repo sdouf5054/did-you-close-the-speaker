@@ -560,7 +560,7 @@ IDLE_VALUES  = [1, 3, 5, 10, 15, 20, 25, 30, 45, 60]
 # ---------------------------------------------------------------------------
 # Watchdog shutdown helper — runs turn-off in a background thread
 # ---------------------------------------------------------------------------
-WATCHDOG_TIMEOUT = 2  # seconds — aggressive but realistic for LAN smart plugs
+WATCHDOG_TIMEOUT = 4  # seconds — allow headroom for Tapo auth + network variance
 
 
 class _WatchdogThread(threading.Thread):
@@ -984,25 +984,54 @@ class MainWindow(QMainWindow):
                             else:
                                 logger.warning("Speaker OFF before sleep may have failed.")
 
-            # ── Shutdown/restart: phase 1 ──
+            # ── Shutdown/restart: phase 1 (QUERYENDSESSION) ──
+            # This is the OS's most generous window — block here to buy time.
             elif msg.message == WM_QUERYENDSESSION:
                 if self.settings.get("watchdog_enabled", False):
-                    logger.info("WM_QUERYENDSESSION — launching watchdog thread.")
+                    logger.info("WM_QUERYENDSESSION — launching watchdog and BLOCKING.")
                     self._shutdown_intercepted = True
+
+                    # Tell Windows we're still cleaning up so it shows
+                    # "This app is preventing shutdown" instead of killing us.
+                    hwnd = int(self.winId())
+                    try:
+                        ctypes.windll.user32.ShutdownBlockReasonCreate(
+                            hwnd, "Turning off speakers safely..."
+                        )
+                    except Exception as e:
+                        logger.warning(f"ShutdownBlockReasonCreate failed: {e}")
+
                     self._start_watchdog_thread()
+
+                    # Block until watchdog finishes (or timeout).
+                    # This is the ONLY reliable place to stall the shutdown sequence.
+                    if self._watchdog_thread is not None:
+                        self._watchdog_thread.done.wait(timeout=WATCHDOG_TIMEOUT + 1.0)
+
+                    try:
+                        ctypes.windll.user32.ShutdownBlockReasonDestroy(hwnd)
+                    except Exception:
+                        pass
+
                 return True, 1
 
-            # ── Shutdown/restart: phase 2 ──
+            # ── Shutdown/restart: phase 2 (ENDSESSION) ──
+            # OS has already decided to shut down. If QUERYENDSESSION did its
+            # job, the watchdog is already done. Just wait for stragglers.
             elif msg.message == WM_ENDSESSION:
-                if msg.wParam:
-                    if self.settings.get("watchdog_enabled", False):
-                        if self._shutdown_intercepted:
-                            logger.info("WM_ENDSESSION — waiting for watchdog thread.")
-                            self._wait_for_watchdog(timeout=WATCHDOG_TIMEOUT + 0.5)
+                if msg.wParam and self.settings.get("watchdog_enabled", False):
+                    if self._shutdown_intercepted:
+                        # QUERYENDSESSION already started it — just wait for completion
+                        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+                            logger.info("WM_ENDSESSION — watchdog still running, waiting briefly.")
+                            self._watchdog_thread.done.wait(timeout=1.0)
                         else:
-                            logger.info("WM_ENDSESSION — last-chance watchdog launch.")
-                            self._start_watchdog_thread()
-                            self._wait_for_watchdog(timeout=WATCHDOG_TIMEOUT + 0.5)
+                            logger.info("WM_ENDSESSION — watchdog already completed.")
+                    else:
+                        # Edge case: QUERYENDSESSION was never received (rare)
+                        logger.info("WM_ENDSESSION — last-chance watchdog launch.")
+                        self._start_watchdog_thread()
+                        self._wait_for_watchdog(timeout=WATCHDOG_TIMEOUT + 0.5)
                 return True, 0
 
         return super().nativeEvent(event_type, message)

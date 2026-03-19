@@ -611,11 +611,20 @@ class MainWindow(QMainWindow):
         self._audio_was_playing = False  # previous tick's audio state
         self._audio_stop_time: float | None = None  # monotonic time when audio stopped
         self._watchdog_thread: _WatchdogThread | None = None  # background watchdog
+        self._safe_power_in_progress = False  # True when Safe buttons initiated shutdown
 
         self._setup_ui()
         self._setup_tray()
         self._setup_idle_timer()
         self._setup_show_event_listener()
+
+        # Clear any leftover shutdown block from a previous session
+        if IS_WINDOWS:
+            try:
+                hwnd = int(self.winId())
+                ctypes.windll.user32.ShutdownBlockReasonDestroy(hwnd)
+            except Exception:
+                pass
 
         # Startup behavior
         if speaker_on_at_startup:
@@ -926,6 +935,36 @@ class MainWindow(QMainWindow):
         self.activateWindow()
         self.raise_()
 
+    def _bring_to_front_for_safe_action(self):
+        """
+        Called after rejecting WM_QUERYENDSESSION.
+        Brings the window to front so user can use Safe power buttons.
+        """
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+        if IS_WINDOWS:
+            hwnd = int(self.winId())
+            HWND_TOPMOST = -1
+            HWND_NOTOPMOST = -2
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_SHOWWINDOW = 0x0040
+
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+            )
+            QTimer.singleShot(3000, lambda: ctypes.windll.user32.SetWindowPos(
+                hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+            ))
+
+        self.status_label.setText("⚠ Speaker ON — turn off first!")
+        self.status_label.setStyleSheet("color: #e74c3c;")
+        logger.info("Window brought to front for safe power action.")
+
     def _quit_app(self):
         self.tray_icon.hide()
         QApplication.quit()
@@ -970,6 +1009,7 @@ class MainWindow(QMainWindow):
                     self._audio_was_playing = False
                     self._audio_stop_time = None
                     self._shutdown_intercepted = False
+                    self._safe_power_in_progress = False
                     QTimer.singleShot(3000, self.refresh_status)
 
                 # ── Entering sleep ──
@@ -985,53 +1025,69 @@ class MainWindow(QMainWindow):
                                 logger.warning("Speaker OFF before sleep may have failed.")
 
             # ── Shutdown/restart: phase 1 (QUERYENDSESSION) ──
-            # This is the OS's most generous window — block here to buy time.
             elif msg.message == WM_QUERYENDSESSION:
                 if self.settings.get("watchdog_enabled", False):
-                    logger.info("WM_QUERYENDSESSION — launching watchdog and BLOCKING.")
-                    self._shutdown_intercepted = True
-
-                    # Tell Windows we're still cleaning up so it shows
-                    # "This app is preventing shutdown" instead of killing us.
-                    hwnd = int(self.winId())
-                    try:
-                        ctypes.windll.user32.ShutdownBlockReasonCreate(
-                            hwnd, "Turning off speakers safely..."
+                    # If WE initiated the shutdown via Safe buttons, let it through
+                    if self._safe_power_in_progress:
+                        logger.info(
+                            "WM_QUERYENDSESSION — safe power in progress, allowing."
                         )
-                    except Exception as e:
-                        logger.warning(f"ShutdownBlockReasonCreate failed: {e}")
+                        return True, 1
 
-                    self._start_watchdog_thread()
+                    if self.plug_state in (PlugState.ON, PlugState.UNKNOWN, PlugState.ERROR):
+                        # Speaker still on → BLOCK shutdown
+                        logger.info(
+                            "WM_QUERYENDSESSION — speaker still on, "
+                            "REJECTING shutdown and bringing window to front."
+                        )
+                        self._shutdown_intercepted = True
 
-                    # Block until watchdog finishes (or timeout).
-                    # This is the ONLY reliable place to stall the shutdown sequence.
-                    if self._watchdog_thread is not None:
-                        self._watchdog_thread.done.wait(timeout=WATCHDOG_TIMEOUT + 1.0)
+                        hwnd = int(self.winId())
+                        try:
+                            ctypes.windll.user32.ShutdownBlockReasonCreate(
+                                hwnd, "Did You Close the Speaker? Speaker is still ON!"
+                            )
+                        except Exception as e:
+                            logger.warning(f"ShutdownBlockReasonCreate failed: {e}")
 
-                    try:
-                        ctypes.windll.user32.ShutdownBlockReasonDestroy(hwnd)
-                    except Exception:
-                        pass
+                        QTimer.singleShot(0, self._bring_to_front_for_safe_action)
+                        return True, 0  # FALSE → reject shutdown
 
+                    else:
+                        # Speaker is already OFF → allow shutdown
+                        logger.info(
+                            "WM_QUERYENDSESSION — speaker is OFF, allowing shutdown."
+                        )
+                        self._shutdown_intercepted = False
+                        return True, 1
+
+                # Watchdog not enabled → allow shutdown
                 return True, 1
 
             # ── Shutdown/restart: phase 2 (ENDSESSION) ──
-            # OS has already decided to shut down. If QUERYENDSESSION did its
-            # job, the watchdog is already done. Just wait for stragglers.
             elif msg.message == WM_ENDSESSION:
-                if msg.wParam and self.settings.get("watchdog_enabled", False):
-                    if self._shutdown_intercepted:
-                        # QUERYENDSESSION already started it — just wait for completion
-                        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
-                            logger.info("WM_ENDSESSION — watchdog still running, waiting briefly.")
-                            self._watchdog_thread.done.wait(timeout=1.0)
-                        else:
-                            logger.info("WM_ENDSESSION — watchdog already completed.")
-                    else:
-                        # Edge case: QUERYENDSESSION was never received (rare)
-                        logger.info("WM_ENDSESSION — last-chance watchdog launch.")
-                        self._start_watchdog_thread()
-                        self._wait_for_watchdog(timeout=WATCHDOG_TIMEOUT + 0.5)
+                if msg.wParam:
+                    logger.info("WM_ENDSESSION (wParam=1) — session ending.")
+                    if self.settings.get("watchdog_enabled", False):
+                        try:
+                            hwnd = int(self.winId())
+                            ctypes.windll.user32.ShutdownBlockReasonDestroy(hwnd)
+                        except Exception:
+                            pass
+                        # Last resort watchdog if not already handled
+                        if not self._safe_power_in_progress:
+                            self._start_watchdog_thread()
+                            if self._watchdog_thread is not None:
+                                self._watchdog_thread.done.wait(timeout=WATCHDOG_TIMEOUT + 0.5)
+                else:
+                    logger.info("WM_ENDSESSION (wParam=0) — shutdown cancelled.")
+                    self._shutdown_intercepted = False
+                    self._safe_power_in_progress = False
+                    try:
+                        hwnd = int(self.winId())
+                        ctypes.windll.user32.ShutdownBlockReasonDestroy(hwnd)
+                    except Exception:
+                        pass
                 return True, 0
 
         return super().nativeEvent(event_type, message)
@@ -1181,6 +1237,18 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"● Turning off speaker for {label.lower()}...")
         self.status_label.setStyleSheet("color: #f39c12;")
 
+        # Mark safe power BEFORE async work starts — so WM_QUERYENDSESSION
+        # sees it on the main thread when shutdown command triggers it.
+        self._safe_power_in_progress = True
+
+        # Clear any leftover shutdown block reason from a previous rejection
+        if IS_WINDOWS:
+            try:
+                hwnd = int(self.winId())
+                ctypes.windll.user32.ShutdownBlockReasonDestroy(hwnd)
+            except Exception:
+                pass
+
         self._run_async(
             self._do_safe_power,
             on_done=lambda _: None,
@@ -1205,11 +1273,14 @@ class MainWindow(QMainWindow):
             logger.info(f"Waiting {delay}s for speaker to safely power down...")
             await asyncio.sleep(delay)
 
+        self.plug_state = PlugState.OFF
+
         action_map = {"shutdown": shutdown_windows, "sleep": sleep_windows, "restart": restart_windows}
         logger.info(f"Executing: {action}")
         action_map[action]()
 
     def _on_power_error(self, err_msg: str, action: str):
+        self._safe_power_in_progress = False  # Reset so future shutdowns can be blocked again
         self._set_busy(False)
         self.plug_state = PlugState.ERROR
         self.status_label.setText("● Power action failed")
